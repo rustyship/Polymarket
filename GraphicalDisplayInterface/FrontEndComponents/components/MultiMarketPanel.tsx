@@ -2,7 +2,8 @@
 import React, { useCallback, useMemo, useState, useEffect } from "react";
 import MarketPricesPanel from "./MarketPricesPanel";
 import ComparePanel from "./ComparePanel";
-
+import ChartsHost from "./ChartHost";
+import "./charts.css"
 /** Backend pair used across the app. */
 export type NameIdPair = {
   marketName: string;
@@ -49,7 +50,7 @@ export default function MultiMarketPanel({
   const [rows, setRows] = useState<Row[]>(() =>
     Array.from({ length: Math.max(1, initialRows) }, () => ({ id: mkId() }))
   );
- 
+
   // Collected BaseParams by row id
   const [byId, setById] = useState<Record<string, BaseParams>>({});
 
@@ -119,55 +120,89 @@ export default function MultiMarketPanel({
     setTimeout(() => setBusy(false), 200);
   }, [results.length, busy]);
 
- return (
+  const [namesIds, setNames] = useState<NameIdPair[]>();
+  useEffect(() => {
+    let ac = new AbortController();
+    fetch(`${apiBase}/markets/names`, { signal: ac.signal })
+      .then(r => r.json())
+      .then(setNames)
+      .catch(()=>{});
+    return () => ac.abort();
+  }, [apiBase]);
+
+  const ROW_WIDTH = 860;  // left panel (MarketPricesPanel) width
+  const CTRL_WIDTH = 220;  // right controls column width
+  const GAP = 2;   // space between columns
+  const TOTAL_WIDTH = ROW_WIDTH + CTRL_WIDTH + GAP +20;
+
+  return (
     <div style={{ padding: 8 }}>
-      {/* Rows */}
-      <div style={{ display: "grid", gridTemplateColumns: "1fr max-content", gap: 12, alignItems: "start" }}>
+      {/* Rows container has a hard total width */}
+      <div
+        style={{
+          width: TOTAL_WIDTH,
+          display: "grid",
+          gridTemplateColumns: "1fr", // each row is its own line
+          gap: 12,
+          alignItems: "start",
+        }}
+      >
         {rows.map((r, idx) => (
-          <div key={r.id} style={{ border: "1px solid #00000033", borderRadius: 8, padding: 8 }}>
+          <div
+            key={r.id}
+            style={{
+              border: "1px solid #00000033",
+              borderRadius: 8,
+              padding: 8,
+              width: TOTAL_WIDTH, // enforce outer bounding box width
+              boxSizing: "border-box",
+            }}
+          >
+            {/* Two fixed columns: left content, right controls */}
             <div
               style={{
                 display: "grid",
-                gridTemplateColumns: "1fr auto",
-                gap: 2,
+                gridTemplateColumns: `${ROW_WIDTH}px ${CTRL_WIDTH}px`,
+                columnGap: GAP,
                 alignItems: "start",
               }}
             >
-              {/* LEFT: stack the MarketPricesPanel (stats will live under it) */}
-              <div>
+              {/* LEFT: Market panel locked to ROW_WIDTH */}
+              <div style={{ width: ROW_WIDTH }}>
                 <MarketPricesPanel
                   initial={r.initial}
                   apiBase={apiBase}
+                  marketNameIds={namesIds}
                   onFetched={(base) => handleFetched(r.id, base)}
                 />
               </div>
 
-              {/* RIGHT: boxed row controls */}
+              {/* RIGHT: boxed row controls, fixed width */}
               <div
-                
                 style={{
                   border: "1px solid #00000055",
                   borderRadius: 8,
-                  padding: 5,                          // small box padding
+                  padding: 5,
                   display: "grid",
-                  gridTemplateColumns: "repeat(2, max-content)", // 2 columns, content-tight
-                  gap: "8px 4px",                              // minimal grid gap
+                  gridTemplateColumns: "repeat(2, max-content)",
+                  gap: "8px 4px",
                   alignItems: "center",
-                  justifyItems: "end",                 // keep items right-aligned in each cell
-                  width: "max-content",                // shrink box to contents
-                  justifySelf: "end",                  // stick box to the right edge
+                  justifyItems: "end",
+                  width: CTRL_WIDTH,
+                  boxSizing: "border-box",
+                  justifySelf: "end",
                 }}
               >
                 <div style={{ fontFamily: "monospace", fontSize: Font, opacity: 0.8 }}>
                   Row {idx + 1}
                 </div>
-                <button onClick={() => duplicateRow(r.id)} style={{ padding: "2px 8px", fontSize: Font}}>
+                <button onClick={() => duplicateRow(r.id)} style={{ padding: "2px 8px", fontSize: Font }}>
                   Duplicate
                 </button>
-                <button onClick={() => removeRow(r.id)} style={{ padding: "2px 8px", fontSize: Font}}>
+                <button onClick={() => removeRow(r.id)} style={{ padding: "2px 8px", fontSize: Font }}>
                   Remove
                 </button>
-                <button onClick={addRow} style={{ padding: "2px 8px", fontSize: Font}}>
+                <button onClick={addRow} style={{ padding: "2px 8px", fontSize: Font }}>
                   + Add market
                 </button>
               </div>
@@ -191,6 +226,25 @@ export default function MultiMarketPanel({
 
       {/* Downstream consumer */}
       <ComparePanel sources={results} apiBase={apiBase} />
+
+      <ChartsHost
+        bounds={{ width: 100, height: 100 }}
+        layout={{
+          minTotalWidth: TOTAL_WIDTH+10,
+          minTotalHeight: 5000,
+          baseX: 30,
+          staggerX: 28,
+          baseY: 50,
+          staggerYFactor: 1.2,
+          staggerYFixed: 10,
+          minFrameWidth: 100,
+          minFrameHeight: 100,
+          headerHeight: 20,
+          innerWidthPct: 1,    // 1 = 100%
+          innerHeightPct: 1,   // 1 = 100%
+        }}
+      />
     </div>
+
   );
 }

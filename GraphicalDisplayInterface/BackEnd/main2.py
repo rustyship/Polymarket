@@ -37,14 +37,17 @@ engine = create_engine(
     connect_args={"options": "-csearch_path=analytics,public"}  # so you can say INSERT INTO prices ...
 )
 
-#defines classes for data output
+class AlignedData(BaseModel):
+    alignedData: List[List[float]] | None
+
 class PricePoint(BaseModel):
-    t: float  # unix time
+    t: float
     p: float
 
 class PriceSeries(BaseModel):
     name: str
     points: List[PricePoint]
+
 
 class nameIdPair(BaseModel):
     marketName: str
@@ -78,25 +81,11 @@ def to_timestamptz(s: str) -> datetime:
     # Normalize to UTC (Postgres stores timestamptz as an instant)
     return dt.astimezone(timezone.utc)
 
-def assert_matches(model: type[BaseModel], data) -> None:
-    """
-    Validate `data` against `model`.
-    Raises ValidationError after printing precise, readable error locations.
-    """
-    try:
-        model.model_validate(data)
-    except ValidationError as e:
-        print("Schema mismatches:")
-        for i, err in enumerate(e.errors(), 1):
-            path = " -> ".join(map(str, err["loc"]))
-            print(f"{i}. at {path}: {err['msg']}  [type={err['type']}]")
-        raise  # keep stack behavior for callers/tests
-
 
 
 
 @app.get("/markets/names", response_model=List[nameIdPair])
-def get_market_options(limit: int = 50, offset: int = 0, top_k: int = 50):
+def get_market_names(limit: int = 50, offset: int = 0, top_k: int = 50):
     """
     Return up to `limit` markets from the TOP `top_k` most-populated market_ids
     (by row count in analytics_2_0.market_prices), joined to names.
@@ -142,31 +131,26 @@ def getPrices(base_param: BaseParams):
                 ORDER BY t;""")
     
     params = {"market_id": market_id, "start": start, "end": end, "fidelity": fidelity}
+    print(params)
     with engine.begin() as conn:
         rows = conn.execute(sql, params).mappings().all()
 
-    marketName = base_param.nameID.marketName
-
-    points = []
+    ad = [[],[]]
     for r in rows:
         time = to_unix_seconds(r["t"])
-        pp = {"t":time, "p":r["price"]}
-        points.append(pp)
-    
-    ps = {"name":marketName,"points":points}
-    return ps
+        ad[0].append(time)
+        ad[1].append(r["price"])
 
-class pricesResponse(BaseModel):
-  base: BaseParams
-  series: PriceSeries
+    if len(ad[0]) == 0:
+        ad = None
+        
+    return {"alignedData":ad}
 
-@app.post("/prices", response_model=pricesResponse)
+
+@app.post("/prices", response_model=AlignedData)
 def prices(base_params:BaseParams):
-    price_series = getPrices(base_params)
-    api_response_get_market = {"base":base_params, "series":price_series}
-    return api_response_get_market
-
-
+    aligned_data_price_series = getPrices(base_params)
+    return aligned_data_price_series
 
 MinutesInYear = 525600
 
@@ -218,40 +202,49 @@ class statsSummary(BaseModel):
     stdex: float
 
 class statsResponse(BaseModel):
-    base: BaseParams
-    macdf: PriceSeries | None = None
-    macds: PriceSeries | None = None
-    series: List[PriceSeries] = None
+    macdHistData : List[List[float]] | None = None
+    macdSigMacdData : List[List[float]] | None = None
+    smaData: List[List[float]] | None = None
+    trendData: List[List[float]] | None = None
     volatility: float | None = None
     volume: float | None = None
     stats: statsSummary | None = None
+
+def nan_indices(lst):
+    # catches float('nan') and numpy.nan if they’re floats in the list
+    return [i for i, x in enumerate(lst) if isinstance(x, float) and math.isnan(x)]
 
 @app.post("/stats", response_model = statsResponse)
 def get_stats(
     req: statsInput
 ):
     features = set(req.features)
-
-    start = req.base_params.start
-    end = req.base_params.end
-
     volatility = None
     volume = None
-    list_p_series = []
     stats = None
-    macd_fast_series = None
-    macd_slow_series = None
+    sma_data = None
+    trend_data = None
+    macd_hist_data = None
+    macd_sig_macd_data = None
 
-    ps = getPrices(req.base_params)["points"]
-    ptDataFrame = pd.DataFrame(ps, columns=["t","p"])
+    ps = getPrices(req.base_params)["alignedData"]
+    times = ps[0]
+    prices = ps[1]
+    ptDataFrame = pd.DataFrame({"t": times, "p": prices})
     ptDataFrame = ptDataFrame.sort_values("t")
+    ptDataFrame.set_index("t")
     ptDataFrame['p'] = pd.to_numeric(ptDataFrame["p"], errors="coerce").astype("float64")
 
     if "sma" in features and req.sma_window:
         ptDataFrame['rolling'] = ptDataFrame.rolling(req.sma_window, on='t', min_periods=1)['p'].mean()
-        points = ptDataFrame[["t", "rolling"]].rename(columns={"rolling": "p"}).to_dict("records")
-        smapSeries = {"name":"sma","points":points}
-        list_p_series.append(smapSeries)
+
+        rolling_list = ptDataFrame['rolling'].to_list()
+        times_list = ptDataFrame["t"].to_list()
+        times_list = times_list[len(times_list)-len(rolling_list):]
+        ad_sma = []
+        ad_sma.append(times_list)
+        ad_sma.append(rolling_list)
+        sma_data = ad_sma
 
     if "trend" in features and req.trend_degree:
         times = ptDataFrame["t"]
@@ -259,31 +252,54 @@ def get_stats(
 
         p = Polynomial.fit(times, prices, req.trend_degree)   # returns [a4, a3, a2, a1, a0]            # prediction function
         y_hat = p(times)
-
-        trend = [{"t": t, "p": round(float(v), 12)} for t, v in zip(times, y_hat)]
-        tred_p_series = {"name":"price_tren","points":trend}
-        list_p_series.append(tred_p_series)
-
+        
+        ad_trend = []
+        ad_trend.append(times.to_list())
+        ad_trend.append(y_hat.tolist())
+        trend_data = ad_trend
 
     if "macd" in features and req.macd_fast and req.macd_slow and req.macd_slow > req.macd_fast:
+        ema = lambda s, n: s.ewm(span=(n), adjust=False, min_periods=(n)).mean()
 
-        ptDataFrame['macd_fast'] = ptDataFrame.rolling(req.macd_fast, on='t', min_periods=req.macd_fast)["p"].mean()
-        ptDataFrame["macd_slow"] = ptDataFrame.rolling(req.macd_slow, on='t', min_periods=req.macd_slow)["p"].mean()
+        ptDataFrame["ema_fast"] = ema(ptDataFrame["p"], req.macd_fast*60)
+        ptDataFrame["ema_slow"] = ema(ptDataFrame["p"], req.macd_slow*60)
+
+        signal_period = 9
+        # 3) MACD components
+        ptDataFrame["macd"] = ptDataFrame["ema_fast"] - ptDataFrame["ema_slow"]
+        ptDataFrame["signal"] = ptDataFrame["macd"].ewm(span=signal_period, adjust=False, min_periods=signal_period).mean()
+        ptDataFrame["histogram"] = ptDataFrame["macd"] - ptDataFrame["signal"]
+        ptDataFrame["signal_pct"] = (ptDataFrame["signal"] / ptDataFrame["p"]) * 100.0 
+        ptDataFrame["macd_pct"] = (ptDataFrame["macd"]/ ptDataFrame["p"]) * 100.0   # percent MACD
+        ptDataFrame["hist_pct"] = (ptDataFrame["histogram"]/ ptDataFrame["p"]) * 100.0
+
+        signal_list = ptDataFrame["signal_pct"].dropna().to_list()
+        ls = len(signal_list)
+
+        hist_list = ptDataFrame["hist_pct"].dropna().to_list()
+        hist_list = hist_list[len(hist_list)-ls:]
+
+        macd_list = ptDataFrame["macd_pct"].dropna().to_list()
+        macd_list = macd_list[len(signal_list)-ls:]
+
+        time_list = ptDataFrame["t"].tolist()
+        time_list = time_list[len(time_list)-ls:]
         
-        aligned = ptDataFrame.loc[ptDataFrame["macd_slow"].notna(), ["t", 'macd_fast', "macd_slow"]].copy()
+        macd_hist_data = []
+        macd_hist_data.append(time_list)
+        macd_hist_data.append(hist_list)
 
-        points_fast =  aligned[["t", "macd_fast"]].rename(columns={"macd_fast": "p"}).to_dict("records")
-        points_slow =  aligned[["t", "macd_slow"]].rename(columns={"macd_slow": "p"}).to_dict("records")
-
-        macd_fast_series = {"name":"macd_fast","points":points_fast}
-        macd_slow_series = {"name":"macd_slow","points":points_slow}
-
+        macd_sig_macd_data = []
+        macd_sig_macd_data.append(time_list)
+        macd_sig_macd_data.append(macd_list)
+        macd_sig_macd_data.append(signal_list)
+        
 
     if "volatility" in features and req.vol_window:
         s = ptDataFrame["p"]
         r = np.log(s).diff(req.vol_window).dropna()
         std = r.std()
-        volatility = math.sqrt(MinutesInYear)/req.vol_window*std
+        volatility = (math.sqrt(MinutesInYear)/req.vol_window*std)*100
 
     if "volume" in features:
         volume = fetch_market_volume(req.base_params.nameID.marketID,)
@@ -296,7 +312,8 @@ def get_stats(
         std_p = ps.std()       # standard deviation (sample, ddof=1)
         stats = {"mean":avg_p,"min":min_p,"max":max_p,"stdex":std_p}
 
-    StatsResponseData = {"base":req.base_params, "macdf": macd_fast_series, "macds":macd_slow_series, "series":list_p_series,"volatility":volatility, "volume":volume, "stats":stats}
+    StatsResponseData = {"macdHistData":macd_hist_data, "macdSigMacdData":macd_sig_macd_data, "smaData":sma_data, "trendData":trend_data, 
+                         "volatility":volatility, "volume":volume, "stats":stats}
 
     return StatsResponseData
 
@@ -313,7 +330,6 @@ def r2(df_series: pd.DataFrame, r2_window: int) -> list[float]:
 
     out = np.nan_to_num(r2m.to_numpy(dtype=float, copy=False), nan=0.0).ravel().tolist()
     
-
     return out
 
 def hit_rate_percentages(
@@ -334,35 +350,27 @@ def hit_rate_percentages(
     # total score per asset; divide by number of scored rows to get a percentage
     denom = len(shares)
     out = (shares.sum(axis=0) / denom).sort_values(ascending=False)
-    return out.to_dict()
+    list_out = out.to_list()
+    return list_out
 
-def getPricesCompare(name_id:nameIdPair,start,end):
+def align_with_pandas(series: List[tuple[np.ndarray, np.ndarray]], how: str = "outer") -> pd.DataFrame:
+    """
+    series: list of (times, prices), each 1-D arrays of equal length per pair.
+    how: 'outer' (union), 'inner' (intersection), 'left'/'right' if you enjoy asymmetry.
+    Returns: [times, p0, p1, ...] where times and prices are numpy arrays.
+    """
+    dfs = []
+    for i, (t, p) in enumerate(series):
+        df = (
+            pd.DataFrame({"time": t, f"p{i}": p})
+              .drop_duplicates("time", keep="last")  # dedup within this series
+              .set_index("time")
+        )
+        dfs.append(df)
 
-    market_id = name_id.marketID
+    aligned = pd.concat(dfs, axis=1, join=how).sort_index()
 
-    sql = text("""SELECT t, price
-                FROM analytics_2_0.market_prices
-                WHERE market_id = :market_id
-                AND t >= :start AND t < :end
-                AND EXTRACT(SECOND FROM t) = 0
-                AND (EXTRACT(MINUTE FROM t)::int % :fidelity) = 0
-                ORDER BY t;""")
-    
-    params = {"market_id": market_id, "start": start, "end": end, "fidelity": "1"}
-    with engine.begin() as conn:
-        rows = conn.execute(sql, params).mappings().all()
-
-    marketName = name_id.marketName
-
-    points = []
-    for r in rows:
-        time = to_unix_seconds(r["t"])
-        pp = {"t":time, "p":r["price"]}
-        points.append(pp)
-    
-    ps = {"name":marketName,"points":points}
-    return ps
-
+    return aligned
 
 class CompareRequest(BaseModel):
     sources: List[BaseParams]
@@ -372,8 +380,9 @@ class CompareRequest(BaseModel):
 
 class CompareResponse(BaseModel):
     rsquared: list[float] | None = None      # flat row-major, len == n*n
-    lines: list[list[float]] | None = None   # [[t],[p1],[p2],...]
-    hitr: dict[str, float] | None = None
+    lines: List[List[float|None]] | None = None   # [[t],[p1],[p2],...]
+    hitr: List[List[float|str]]| None = None
+    marketNames: List[str]
 
 @app.post("/compare", response_model=CompareResponse)
 def post_compare(req: CompareRequest):
@@ -382,7 +391,7 @@ def post_compare(req: CompareRequest):
     features = set(req.features)
     r2_window = req.r2_window
     hit_win = req.hit_rate_window
-    compare_results = {"rsquared":None,"lines":None,"hitr":None}
+    compare_results = {"rsquared":None,"lines":None,"hitr":None, "marketNames":None}
 
     market_name_list = []
     end_list = []
@@ -399,37 +408,32 @@ def post_compare(req: CompareRequest):
     start = datetime.fromtimestamp(start)
     end = datetime.fromtimestamp(end)
 
-    price_list = []
-    for response in sources:
-        temp_price_list = []
-        prices = getPricesCompare(response.nameID,start,end)
-        if len(price_list) == 0:
-            temp_time_list = []
-            for tp in prices["points"]:     
-                temp_time_list.append(float(tp["t"]))
-            price_list.append(temp_time_list)
-        for tp in prices["points"]:
-            temp_price_list.append(float(tp["p"]))
-        price_list.append(temp_price_list)
-    #current structure of price list is [[time][price1][price2]...]
+    ad_list = []
+    for base in sources:
+        base.fidelity = 1
+        ad = getPrices(base)["alignedData"]
+        time = np.array(ad[0])
+        price = np.array(ad[1])
+        ad_list.append((time,price))
 
-    names = [f"p{i+1}" for i in range(len(market_name_list))]
-    data = {"t": price_list[0]}
-    for name, pl in zip(names, price_list[1:]):
-        data[name] = pl
-    df_series = pd.DataFrame(data).set_index("t")
-    
+    aligned = align_with_pandas(ad_list)
+    aligned.dropna(inplace=True)
+
     if "r2" in features and r2_window:
-        rsquared = r2(df_series, r2_window)
+        rsquared = r2(aligned, r2_window)
         compare_results["rsquared"] = rsquared
 
     if "lines" in features:
-       compare_results["lines"] = price_list
+        times = aligned.index.tolist()                    # times won’t be NaN
+        prices = [aligned[c].tolist() for c in aligned.columns]  # now contains None, not NaN
+        lines = [times] + prices
+        compare_results["lines"] = lines
 
     if "hit_rate" in features and hit_win:
-        hitr = hit_rate_percentages(df_series,hit_win)
-        print(hitr)
+        rates = hit_rate_percentages(aligned,hit_win)
+        hitr = []
+        hitr.append(market_name_list)
+        hitr.append(rates)
         compare_results["hitr"] = hitr
-
-
+    compare_results["marketNames"] = market_name_list
     return compare_results

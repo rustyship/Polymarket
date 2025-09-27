@@ -1,33 +1,31 @@
 // /mnt/data/MarketPricesPanel.tsx
-import React, { useMemo, useState } from "react";
+import React, { useState } from "react";
 import DatePicker from "react-datepicker";
-import "react-datepicker/dist/react-datepicker.css";
 
 import MarketNameSelect from "./MarketNameSelect";
-import { DraggablePriceChart } from "./DraggablePriceChart";
 import { StatsPanel } from "./StatsPanel";
+import "react-datepicker/dist/react-datepicker.css";
+import { useChartStore } from "./chartStore";
+import type { ChartInput } from "./types";
+import type { NameIdPair, BaseParams } from "./types";
 
-// ---- Types ----
-type PricePoint = { t: number; p: number };            // time and price
-type PriceSeries = { name: string; points: PricePoint[] };
-
-type NameIdPair = {
-  marketName: string;
-  marketID: string;
+type MarketPricesPanelProps = {
+  apiBase?: string;
+  initial?: BaseParams;
+  marketNameIds?: NameIdPair[];
+  // Emit the FULL API response so parent can do handleFetched(r.id, resp)
+  onFetched?: (base: BaseParams) => void; // <— now only BaseParams
 };
 
-type BaseParams = {
-  // base params now take a name-id pair (not a plain string)
-  nameID: NameIdPair;
-  start: Date | null;
-  end: Date | null;
-  fidelity: number; // minutes
-};
 
-export type ApiResponseGetMarket = {
-  base: BaseParams;
-  series: PriceSeries;
-};
+type alignedDataResponse = {
+  alignedData: number[][] | null
+}
+
+// push straight to the store
+function pushChartToStore(chart: ChartInput) {
+  useChartStore.getState().upsert(chart);
+}
 
 const API_BASE = import.meta.env.VITE_API_URL || "http://localhost:8000";
 
@@ -43,7 +41,7 @@ const controlStyle: React.CSSProperties = {
 async function fetchPrices(
   params: BaseParams,
   apiBase: string = API_BASE
-): Promise<ApiResponseGetMarket> {
+): Promise<alignedDataResponse> {
   const res = await fetch(`${apiBase}/prices`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -55,36 +53,15 @@ async function fetchPrices(
     throw new Error(txt || `HTTP ${res.status}`);
   }
 
-  return (await res.json()) as ApiResponseGetMarket;
+  return (await res.json()) as alignedDataResponse;
 }
 
-// Simple adapter so StatsPanel can draw series using your draggable chart
-function ChartAdapter({ series }: { series: PriceSeries }) {
-  return (
-    <DraggablePriceChart
-      data={series.points}
-      title={`Series: ${series.name}`}
-      defaultPosition={{ x: 40, y: 40 }}
-      defaultSize={{ width: 150, height: 150 }}
-      minHeight={50}
-      minWidth={50}
-      precision={4}
-    />
-  );
-}
-
-// ---- Props ----
-type MarketPricesPanelProps = {
-  apiBase?: string;
-  initial?: BaseParams;
-  // Emit the FULL API response so parent can do handleFetched(r.id, resp)
-  onFetched?: (base: BaseParams) => void; // <— now only BaseParams
-};
 
 // ---- Component ----
 export default function MarketPricesPanel({
   apiBase = API_BASE,
   initial,
+  marketNameIds,
   onFetched,
 }: MarketPricesPanelProps) {
   const [stage, setStage] = useState<"idle" | "loading" | "error" | "ready">("idle");
@@ -97,8 +74,6 @@ export default function MarketPricesPanel({
   const [fidelity, setFidelity] = useState<number>(initial?.fidelity ?? 1);
 
   // Data: now a single series
-  const [series, setSeries] = useState<PriceSeries | null>(null);
-  const marketName = nameID.marketName;
   const base: BaseParams = { nameID, start, end, fidelity };
 
   async function go() {
@@ -106,38 +81,33 @@ export default function MarketPricesPanel({
       setStage("loading");
       setError(null);
 
-      const resp = await fetchPrices(base, apiBase); // fetch call
-      setSeries(resp.series);
+      const resp: alignedDataResponse = await fetchPrices(base, apiBase); // your fetch call
+      const data = resp.alignedData;  
       setStage("ready");
 
-      // critical change: bubble up the FULL response, not just base
+      // bubble up whatever you need
       onFetched?.(base);
+
+      // build and send the chart only after success
+      if (data) {
+        const fmt = (d?: Date | null) => (d ? d.toISOString() : "");
+        const id = `${base.nameID.marketName},${fmt(base.start)},${fmt(base.end)}`;
+        const chart: ChartInput = {
+          id: id,
+          data: data,
+          title: base.nameID.marketName,
+          seriesNames: ["p"], // or whatever series you’ve got
+          yLabel: "price",
+          xLabel: "time",
+        };
+
+        pushChartToStore(chart); // Zustand write belongs in handlers/effects, not useMemo
+      }
     } catch (err: any) {
       setError(err?.message ?? "Failed to fetch");
       setStage("error");
     }
   }
-
-  // Layout for single draggable chart when ready
-  const body = useMemo(() => {
-    if (stage !== "ready" || !series) return null;
-
-    const START = { x: 40, y: 40 };
-    const SIZE = { width: 200, height: 80 };
-
-    return (
-      <DraggablePriceChart
-        key={series.name || "series"}
-        data={series.points}
-        title={`Series: ${series.name ?? ""}`}
-        defaultPosition={START}
-        defaultSize={SIZE}
-        minHeight={50}
-        minWidth={50}
-        precision={4}
-      />
-    );
-  }, [stage, series, error]);
 
   return (
     <>
@@ -150,10 +120,12 @@ export default function MarketPricesPanel({
           marginTop: 2,
         }}
       >
+        
         <div style={{ display: "flex", gap: 8, marginBottom: 4, alignItems: "center", flexWrap: "nowrap" }}>
           <MarketNameSelect
             value={nameID.marketID}
-            onChange={(pair: NameIdPair) => setNameID(pair)} 
+            marketNameIds={marketNameIds}
+            onChange={(pair: NameIdPair) => setNameID(pair)}
             apiUrl={`${API_BASE}/markets/names`}
             style={controlStyle}
           />
@@ -218,11 +190,8 @@ export default function MarketPricesPanel({
 
       {/* Box 2: stats */}
       <div style={{ marginTop: 8 }}>
-        <StatsPanel base={base} apiBase={API_BASE} Chart={ChartAdapter} />
+        <StatsPanel base={base} apiBase={API_BASE} />
       </div>
-
-      {/* Body OUTSIDE both boxes */}
-      {body && <div style={{ marginTop: 12 }}>{body}</div>}
     </>
   );
 }

@@ -1,12 +1,9 @@
-.uplot-vertical-labels .u-plot .u-axis.u-bottom .u-values > div {
-  /* vertical timestamps */
-  writing-mode: horizontal-tb;
-  text-orientation: mixed;
-  white-space: nowrap;
-  line-height: 1;            /* avoid extra spacing *//* vertical-rl puts text top-to-bottom; flip to read bottom-to-top */
-}
 
-/* make sure labels can extend inside the axis box */
-.uplot-vertical-labels .u-plot .u-axis.u-bottom .u-values {
-  overflow: visible;
+.chart .u-legend {
+  display: flex !important;
+  flex-wrap: wrap;
+  gap: 2px;
+  align-items: center;
+  font-size: 8px;
+  line-height: 1.2;
 }
